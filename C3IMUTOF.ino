@@ -1,13 +1,12 @@
-/*  ESP32-C3 + MPU6050 + VL53L4CD → NimBLE notify batch @200Hz
- *  Fixed for Arduino Core 3.3.11.
- *  No ISR I2C, no hw_timer, std::string for BLE, named callback classes.
+/*  ESP32-C3 + MPU6050 + VL53L0X → NimBLE batch @200Hz
+ *  Units: 1=Right Leg, 2=Left Leg, 3=Torso
+ *  Works with 1–3 units independently.
  */
 #include <NimBLEDevice.h>
 #include <NimBLEServer.h>
-#include <NimBLEUtils.h>
 #include <Wire.h>
 
-// ---------- USER CONFIG ----------
+// ---------- CONFIG ----------
 #define UNIT_ID         1
 #define IMU_HZ          200
 #define BATCH_SIZE      10
@@ -15,7 +14,7 @@
 #define IMU_ADDR        0x68
 #define SDA_PIN         8
 #define SCL_PIN         9
-// ---------------------------------
+// -----------------------------
 
 #define MPU_REG_WHO     0x75
 #define MPU_REG_PWR1    0x6B
@@ -24,19 +23,20 @@
 #define MPU_REG_SMPLRT  0x19
 #define MPU_REG_DLPF    0x1A
 
-#define VL53_WHO        0x00F8
-#define VL53_RESULT     0x008E
+// VL53L0X
+#define VL53_ID         0x00
+#define VL53_DISTANCE   0x1E
+#define VL53_RANG_STAT  0x14
 
 #define SERVICE_UUID    "6E400001-B5A3-F393-E0A9-E50E24DCCA9E"
 #define CHAR_UUID       "6E400003-B5A3-F393-E0A9-E50E24DCCA9E"
 #define CTRL_UUID       "6E400002-B5A3-F393-E0A9-E50E24DCCA9E"
 
-// FIX: declare BOTH characteristics at global scope
 NimBLECharacteristic *pChar;
 NimBLECharacteristic *pControl;
 
-volatile bool imuReady = false;
 volatile int16_t imuBuf[6];
+volatile bool imuReady = false;
 volatile uint16_t tofDist = 0;
 volatile uint32_t tofTimestamp = 0;
 
@@ -44,12 +44,12 @@ struct Sample { uint32_t ts; int16_t ax,ay,az,gx,gy,gz; uint16_t d; };
 Sample batch[BATCH_SIZE];
 volatile uint8_t batchCount = 0;
 volatile uint32_t seq = 0;
-uint64_t epochStart = 0;   // phone_epoch_ms = millis() + epochStart
+uint64_t epochStart = 0;
 
 const uint32_t PERIOD_US = 1000000L / IMU_HZ;
 volatile uint32_t lastSampleUs = 0;
 
-// ---- I2C helpers ----
+// ---- I2C ----
 void mpuWrite(uint8_t reg, uint8_t v){
   Wire.beginTransmission(IMU_ADDR); Wire.write(reg); Wire.write(v); Wire.endTransmission();
 }
@@ -66,14 +66,29 @@ uint16_t tofRead16(uint16_t reg){
   Wire.requestFrom((uint8_t)TOF_ADDR,(uint8_t)2);
   return (Wire.read()<<8)|Wire.read();
 }
+void tofWrite8(uint16_t reg, uint8_t v){
+  Wire.beginTransmission(TOF_ADDR); Wire.write(reg>>8); Wire.write(reg&0xFF); Wire.write(v); Wire.endTransmission();
+}
+uint8_t tofRead8(uint16_t reg){
+  Wire.beginTransmission(TOF_ADDR); Wire.write(reg>>8); Wire.write(reg&0xFF); Wire.endTransmission();
+  Wire.requestFrom((uint8_t)TOF_ADDR,(uint8_t)1); return Wire.read();
+}
 
+// ---- VL53L0X init (verified minimal ST sequence) ----
 void initTOF(){
-  Wire.beginTransmission(TOF_ADDR); Wire.write(0xFF); Wire.write(0x01); Wire.endTransmission();
-  uint16_t id = tofRead16(VL53_WHO);
-  if(id != 0xEACC) Serial.printf("TOF id error: %04X\n", id);
-  tofWrite16(0x0096, 0x00); delay(10);
-  tofWrite16(0x0096, 0x01); delay(10);
-  tofWrite16(0x0080, 0x04);
+  uint8_t id = tofRead8(VL53_ID);
+  if(id != 0xEE){ Serial.printf("VL53L0X id error: %02X\n", id); return; }
+
+  tofWrite8(0x80, 0x01);       // reset
+  delay(1);
+  tofWrite8(0x88, 0x01);       // I2C standard mode
+  delay(1);
+  tofWrite8(0xFF, 0x01); tofWrite8(0x00, 0x00); tofWrite8(0xFF, 0x00);
+  tofWrite8(0xC0, 0x01);       // OS cal
+  delay(10);
+  tofWrite8(0x00, 0x40);       // start ranging
+  delay(2);
+  Serial.println("VL53L0X init OK");
 }
 
 void initIMU(){
@@ -85,7 +100,7 @@ void initIMU(){
   mpuWrite(0x1B, 0x18);
 }
 
-// ---- Named BLE callback classes ----
+// ---- BLE ----
 class CtrlCallbacks : public NimBLECharacteristicCallbacks {
   void onWrite(NimBLECharacteristic* c){
     std::string s = c->getValue();
@@ -115,7 +130,6 @@ void setup(){
   NimBLEService *pSvc = pServer->createService(SERVICE_UUID);
   pChar = pSvc->createCharacteristic(CHAR_UUID,
               NIMBLE_PROPERTY::NOTIFY | NIMBLE_PROPERTY::READ);
-
   pControl = pSvc->createCharacteristic(CTRL_UUID, NIMBLE_PROPERTY::WRITE);
   pControl->setCallbacks(new CtrlCallbacks());
 
@@ -123,6 +137,7 @@ void setup(){
   NimBLEDevice::startAdvertising();
 
   lastSampleUs = micros();
+  Serial.printf("Unit %d ready\n", UNIT_ID);
 }
 
 void loop(){
@@ -138,7 +153,7 @@ void loop(){
     }
 
     if((seq % 4) == 0){
-      Wire.beginTransmission(TOF_ADDR); Wire.write(0x00); Wire.write(0x8E); Wire.endTransmission();
+      Wire.beginTransmission(TOF_ADDR); Wire.write(0x00); Wire.write(VL53_DISTANCE); Wire.endTransmission();
       Wire.requestFrom((uint8_t)TOF_ADDR,(uint8_t)2);
       if(Wire.available()>=2){
         tofDist = (Wire.read()<<8)|Wire.read();
@@ -150,11 +165,11 @@ void loop(){
 
     if(batchCount < BATCH_SIZE){
       batch[batchCount++] = {millis(), imuBuf[0],imuBuf[1],imuBuf[2],
-                                imuBuf[3],imuBuf[4],imuBuf[5], d};
+                                      imuBuf[3],imuBuf[4],imuBuf[5], d};
     }
 
     if(batchCount >= BATCH_SIZE){
-      uint8_t buf[1 + 2 + 4 + BATCH_SIZE*18];  // = 187 bytes
+      uint8_t buf[1 + 2 + 4 + BATCH_SIZE*18];  // 187 bytes
       buf[0] = UNIT_ID;
       buf[1] = (seq>>8)&0xFF; buf[2] = seq&0xFF;
       uint32_t netTs = (uint32_t)((millis() + epochStart)/1000);
@@ -167,5 +182,5 @@ void loop(){
       batchCount = 0;
     }
   }
-  yield();
+  yield();  // yield to BLE task instead of light sleep
 }
