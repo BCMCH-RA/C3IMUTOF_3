@@ -1,96 +1,66 @@
-<!DOCTYPE html>
+<!doctype html>
 <html>
-<head>
-<meta charset="utf-8">
-<title>IMU+TOF BT Logger</title>
-<style>
- body{font-family:sans-serif;max-width:720px;margin:auto;padding:1em;background:#111;color:#eee;}
- button{padding:0.6em 1.2em;margin:0.2em;border:none;border-radius:6px;cursor:pointer;font-size:1em;}
- #connect{background:#0a0;color:#000;} #start{background:#060;color:#000;}
- #stop{background:#e44;color:#fff;} #dl{background:#44e;color:#fff;}
- #log{height:40vh;overflow-y:auto;background:#222;padding:0.5em;font-family:monospace;font-size:12px;}
-</style>
-</head>
+<head><meta charset="utf-8"><title>ESP32-C3 IMU</title></head>
 <body>
-<h2>IMU6050 + TOF Logger</h2>
 <button id="connect">Connect</button>
-<button id="start" disabled>Start</button>
-<button id="stop" disabled>Stop</button>
-<button id="dl" disabled>Download CSV</button>
-<div>Status: <span id="st">idle</span></div>
-<div>Samples: <span id="cnt">0</span></div>
-<pre id="log"></pre>
-
+<div id="status"></div>
 <script>
-let device, server, svc, charNotify, charCtrl;
-let recording=false, rows=[];
-let epochOffset = 0;  // phoneUnix - deviceMillisAtConnect
+const SF = "6E400001-B5A3-F393-E0A9-E50E24DCCA9E";
+const DC = "6E400003-B5A3-F393-E0A9-E50E24DCCA9E";
+const CC = "6E400002-B5A3-F393-E0A9-E50E24DCCA9E";
+const BATCH = 10;
+const SAMPLE_BYTES = 18; // ts(4)+6×int16(12)+dist(2)
 
-const SVC="6E400001-B5A3-F393-E0A9-E50E24DCCA9E";
-const CHR="6E400003-B5A3-F393-E0A9-E50E24DCCA9E";
-const CTRL="6E400002-B5A3-F393-E0A9-E50E24DCCA9E";
+let device, server, chData, chCtrl;
 
-document.getElementById('connect').onclick = async ()=>{
+document.getElementById("connect").onclick = async () => {
   device = await navigator.bluetooth.requestDevice({
-    acceptAllDevices:true, optionalServices:[SVC]});
+    acceptAllDevices: true, optionalServices: [SF]
+  });
   server = await device.gatt.connect();
-  svc = await server.getPrimaryService(SVC);
-  charNotify = await svc.getCharacteristic(CHR);
-  charCtrl = await svc.getCharacteristic(CTRL);
+  const svc = await server.getPrimaryService(SF);
+  chData = await svc.getCharacteristic(DC);
+  chCtrl = await svc.getCharacteristic(CC);
 
-  // send current Unix epoch (4 bytes LE)
-  const now = Math.floor(Date.now()/1000);
+  // 1. Epoch sync: send phone's Unix time (seconds) as 4 LE bytes
+  const epochSec = Math.floor(Date.now() / 1000);
   const buf = new ArrayBuffer(4);
-  new DataView(buf).setUint32(0, now, true);
-  await charCtrl.writeValue(buf);
+  new DataView(buf).setUint32(0, epochSec, true); // LE
+  await chCtrl.writeValue(buf);
 
-  // request large MTU
-  if(device.gatt.requestMtu) await device.gatt.requestMTU(247);
-
-  document.getElementById('st').textContent='connected';
-  document.getElementById('start').disabled=false;
-  charNotify.startNotifications();
-  charNotify.addEventListener('characteristicvaluechanged', onData);
+  // 2. Start notifications
+  await chData.startNotifications();
+  chData.addEventListener("characteristicvaluechanged", onData);
+  document.getElementById("status").textContent = "connected";
 };
 
-function onData(e){
-  const d = new Uint8Array(e.target.value.buffer);
-  // [unit(1)][seqHi][seqLo][ts32][...18*batch]
-  const unit=d[0], seq=(d[1]<<8)|d[2];
-  const tsDevice = new DataView(d.buffer,3,4).getUint32(0,true);
-  const phoneTs = (tsDevice + epochOffset); // approximate
-  let off=7;
-  while(off+18<=d.length){
-    const ax=new Int16Array(d.buffer,off,1)[0];
-    const ay=new Int16Array(d.buffer,off+2,1)[0];
-    const az=new Int16Array(d.buffer,off+4,1)[0];
-    const gx=new Int16Array(d.buffer,off+6,1)[0];
-    const gy=new Int16Array(d.buffer,off+8,1)[0];
-    const gz=new Int16Array(d.buffer,off+10,1)[0];
-    const dist=new Uint16Array(d.buffer,off+12,1)[0];
-    rows.push({unit,seq,ts:phoneTs,ax,ay,az,gx,gy,gz,dist});
-    off+=18;
+function onData(e) {
+  const v = e.target.value;                    // DataView
+  const len = v.byteLength;
+  if (len !== 1 + 2 + 4 + BATCH_SIZE * SAMPLE_BYTES) {
+    console.warn("unexpected size", len);      // should be 187
+    return;
   }
-  document.getElementById('cnt').textContent=rows.length;
-}
+  const unitId = v.getUint8(0);
+  const seq    = v.getUint16(1, true);         // LE
+  const baseTs = v.getUint32(3, true);         // LE, seconds since epoch
 
-document.getElementById('start').onclick = ()=>{
-  recording=true; rows=[];
-  document.getElementById('stop').disabled=false;
-  document.getElementById('st').textContent='recording';
-};
-document.getElementById('stop').onclick = ()=>{
-  recording=false;
-  document.getElementById('dl').disabled=false;
-  document.getElementById('st').textContent='stopped ('+rows.length+' samples)';
-};
-document.getElementById('dl').onclick = ()=>{
-  let csv='unit,seq,timestamp,ax,ay,az,gx,gy,gz,dist\n';
-  rows.forEach(r=>csv+=`${r.unit},${r.seq},${r.ts},${r.ax},${r.ay},${r.az},${r.gx},${r.gy},${r.gz},${r.dist}\n`);
-  const blob=new Blob([csv],{type:'text/csv'});
-  const a=document.createElement('a'); a.href=URL.createObjectURL(blob);
-  a.download='imu_tof_'+Date.now()+'.csv'; a.click();
-};
+  const samples = [];
+  for (let i = 0; i < BATCH_SIZE; i++) {
+    const o = 7 + i * SAMPLE_BYTES;
+    const ts = v.getUint32(o, true);
+    const ax = v.getInt16(o+4, true);
+    const ay = v.getInt16(o+6, true);
+    const az = v.getInt16(o+8, true);
+    const gx = v.getInt16(o+10, true);
+    const gy = v.getInt16(o+12, true);
+    const gz = v.getInt16(o+14, true);
+    const d  = v.getUint16(o+16, true);
+    samples.push({ts, ax,ay,az, gx,gy,gz, d});
+  }
+  console.log(unitId, seq, baseTs, samples);
+  // render / stream here
+}
 </script>
 </body>
 </html>
